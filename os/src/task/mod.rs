@@ -17,6 +17,9 @@ mod task;
 use crate::config::MAX_APP_NUM;
 use crate::loader::{get_num_app, init_app_cx};
 use crate::sync::UPSafeCell;
+use alloc::collections::BTreeMap;
+use alloc::vec;
+use alloc::vec::Vec;
 use lazy_static::*;
 use switch::__switch;
 pub use task::{TaskControlBlock, TaskStatus};
@@ -45,6 +48,8 @@ pub struct TaskManagerInner {
     tasks: [TaskControlBlock; MAX_APP_NUM],
     /// id of current `Running` task
     current_task: usize,
+    /// 记录所有任务的系统调用数
+    syscall_num : Vec<BTreeMap<usize,usize>>
 }
 
 lazy_static! {
@@ -65,6 +70,7 @@ lazy_static! {
                 UPSafeCell::new(TaskManagerInner {
                     tasks,
                     current_task: 0,
+                    syscall_num : vec![BTreeMap::new() ; num_app]
                 })
             },
         }
@@ -103,7 +109,19 @@ impl TaskManager {
         let current = inner.current_task;
         inner.tasks[current].task_status = TaskStatus::Exited;
     }
-
+    /// 增加当前正在运行的任务记录的系统调用数量
+    fn add_current_syscall_num (&self, id : usize) {
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        let counter = inner.syscall_num[current].entry(id).or_insert(0);
+        *counter += 1;
+    }
+    /// 获取当前正在运行的任务记录的系统调用数量
+    fn get_current_syscall_num(&self, id : usize) -> usize {
+        let inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.syscall_num[current].get(&id).copied().unwrap_or_default()
+    }
     /// Find next task to run and return task id.
     ///
     /// In this case, we only return the first `Ready` task in task list.
@@ -168,4 +186,14 @@ pub fn suspend_current_and_run_next() {
 pub fn exit_current_and_run_next() {
     mark_current_exited();
     run_next_task();
+}
+
+/// 增加当前任务记录的系统调用数量
+pub fn add_current_syscall_num(id : usize) {
+    TASK_MANAGER.add_current_syscall_num(id);
+}
+
+/// 获取当前任务记录的系统调用数量
+pub fn get_current_syscall_num(id : usize) -> usize{
+    TASK_MANAGER.get_current_syscall_num(id)
 }

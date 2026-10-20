@@ -15,7 +15,10 @@
 //! We then call [`task::run_first_task()`] and for the first time go to
 //! userspace.
 
-#![deny(missing_docs)]
+// 先看了下测试代码需要的 sys_trace 实现，发现有这个枚举类型 TraceRequest 在 user/src/lib.rs#L110 ，复制了过来，发现报错了 
+// 报错原因 missing documentation for an enum main.rs(18, 9): the lint level is defined here
+// 问 gpt 发现是下面这一行代码规定了所有函数都要加上注释
+#![deny(missing_docs)] // 写函数和结构体需要加上文档注释
 #![deny(warnings)]
 #![no_std]
 #![no_main]
