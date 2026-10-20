@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "courseId": 2073,
+  "repository": "LearningOS/2026a-rcore-Hin629",
+  "user": "Hin629",
+  "totalScore": 500,
+  "chapters": {
+    "ch3": {
+      "points": "7/7",
+      "score": 100,
+      "commit": "67e60a7031575900e6b83d8540302b9678b662b9"
+    }
+  },
+  "score": 100,
+  "upload": {
+    "status": "pending",
+    "runId": "39432281546",
+    "runAttempt": "1"
+  }
+}
