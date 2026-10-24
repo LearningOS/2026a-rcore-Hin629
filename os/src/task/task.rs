@@ -54,7 +54,7 @@ impl TaskControlBlock {
             kernel_stack_bottom.into(),
             kernel_stack_top.into(),
             MapPermission::R | MapPermission::W,
-        );
+        ).unwrap(); // TODO: 解决错误处理
         let task_control_block = Self {
             task_status,
             task_cx: TaskContext::goto_trap_return(kernel_stack_top),

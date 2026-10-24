@@ -1,9 +1,22 @@
 //! Implementation of [`PageTableEntry`] and [`PageTable`].
 
+use crate::mm::PhysAddr;
+
 use super::{frame_alloc, FrameTracker, PhysPageNum, StepByOne, VirtAddr, VirtPageNum};
+use _core::fmt::Debug;
 use alloc::vec;
 use alloc::vec::Vec;
 use bitflags::*;
+/// 内存分配错误
+#[derive(Debug)]
+pub enum MemoryError {
+    /// 重复分配错误
+    PageMultiMapped,
+    /// 重复释放错误
+    PageNotMapped,
+    /// 区间格式错误
+    MemoryRangeError
+}
 
 bitflags! {
     /// page table entry flags
@@ -70,6 +83,14 @@ impl PageTableEntry {
     pub fn executable(&self) -> bool {
         (self.flags() & PTEFlags::X) != PTEFlags::empty()
     }
+    /// 判断当前 pte 的权限是否至少满足传进来的 pte 需要的权限
+    pub fn check_if_satifised(&self, flags: PTEFlags) -> bool {
+        (self.flags() & flags) == flags
+    }
+    /// 把 pte 转换成 physical Addr 
+    pub fn to_physical_addr(&self, offset : usize) -> PhysAddr{
+        (((self.bits >> 10 & ((1usize << 44) - 1)) << 12) | (offset & ((1usize << 12) - 1))).into()
+    }
 }
 
 /// page table structure
@@ -135,17 +156,21 @@ impl PageTable {
     }
     /// set the map between virtual page number and physical page number
     #[allow(unused)]
-    pub fn map(&mut self, vpn: VirtPageNum, ppn: PhysPageNum, flags: PTEFlags) {
+    pub fn map(&mut self, vpn: VirtPageNum, ppn: PhysPageNum, flags: PTEFlags) -> Result<(),MemoryError> {
         let pte = self.find_pte_create(vpn).unwrap();
-        assert!(!pte.is_valid(), "vpn {:?} is mapped before mapping", vpn);
+        if pte.is_valid() {return Err(MemoryError::PageMultiMapped);}
+        // assert!(!pte.is_valid(), "vpn {:?} is mapped before mapping", vpn);
         *pte = PageTableEntry::new(ppn, flags | PTEFlags::V);
+        Ok(())
     }
     /// remove the map between virtual page number and physical page number
     #[allow(unused)]
-    pub fn unmap(&mut self, vpn: VirtPageNum) {
-        let pte = self.find_pte(vpn).unwrap();
-        assert!(pte.is_valid(), "vpn {:?} is invalid before unmapping", vpn);
+    pub fn unmap(&mut self, vpn: VirtPageNum) -> Result<(),MemoryError>{
+        let pte = self.find_pte(vpn).ok_or(MemoryError::PageNotMapped)?;
+        if !pte.is_valid() {return Err(MemoryError::PageNotMapped);}
+        // assert!(pte.is_valid(), "vpn {:?} is invalid before unmapping", vpn);
         *pte = PageTableEntry::empty();
+        Ok(())
     }
     /// get the page table entry from the virtual page number
     pub fn translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry> {

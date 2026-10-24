@@ -15,7 +15,10 @@ mod switch;
 mod task;
 
 use crate::loader::{get_app_data, get_num_app};
+use crate::mm::{MapPermission, MemoryError, PTEFlags, PhysAddr, VirtAddr};
 use crate::sync::UPSafeCell;
+use alloc::collections::BTreeMap;
+use alloc::vec;
 use crate::trap::TrapContext;
 use alloc::vec::Vec;
 use lazy_static::*;
@@ -46,6 +49,8 @@ struct TaskManagerInner {
     tasks: Vec<TaskControlBlock>,
     /// id of current `Running` task
     current_task: usize,
+    /// 记录所有任务的系统调用数
+    syscall_num : Vec<BTreeMap<usize,usize>>
 }
 
 lazy_static! {
@@ -64,6 +69,7 @@ lazy_static! {
                 UPSafeCell::new(TaskManagerInner {
                     tasks,
                     current_task: 0,
+                    syscall_num : vec![BTreeMap::new() ; num_app],
                 })
             },
         }
@@ -101,6 +107,43 @@ impl TaskManager {
         let mut inner = self.inner.exclusive_access();
         let cur = inner.current_task;
         inner.tasks[cur].task_status = TaskStatus::Exited;
+    }
+
+    /// 增加当前正在运行的任务记录的系统调用数量
+    fn add_current_syscall_num (&self, id : usize) {
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        let counter = inner.syscall_num[current].entry(id).or_insert(0);
+        *counter += 1;
+    }
+    /// 获取当前正在运行的任务记录的系统调用数量
+    fn get_current_syscall_num(&self, id : usize) -> usize {
+        let inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.syscall_num[current].get(&id).copied().unwrap_or_default()
+    }
+
+    /// 检查目标虚拟地址在不在当前运行的任务的地址空间中，并且要满足权限要求
+    /// 
+    /// 如果在，返回物理地址
+    fn va_in_current_and_satisfied(&self,va : VirtAddr, flag : PTEFlags) -> Option<PhysAddr> {
+        let inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.tasks[current].memory_set.va_is_in_and_satisfied(va, flag)
+    }
+
+    /// 映射一块地址
+    fn mmap(&self, start_va : VirtAddr, end_va : VirtAddr, permission : MapPermission) -> Result<(),MemoryError> {
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.tasks[current].memory_set.insert_framed_area(start_va, end_va, permission)
+    }
+
+    /// 取消映射一块地址
+    fn munmap(&self, start_va : VirtAddr, end_va : VirtAddr) -> Result<(),MemoryError> {
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.tasks[current].memory_set.unmap(start_va, end_va)
     }
 
     /// Find next task to run and return task id.
@@ -201,4 +244,31 @@ pub fn current_trap_cx() -> &'static mut TrapContext {
 /// Change the current 'Running' task's program break
 pub fn change_program_brk(size: i32) -> Option<usize> {
     TASK_MANAGER.change_current_program_brk(size)
+}
+
+/// 增加当前任务记录的系统调用数量
+pub fn add_current_syscall_num(id : usize) {
+    TASK_MANAGER.add_current_syscall_num(id);
+}
+
+/// 获取当前任务记录的系统调用数量
+pub fn get_current_syscall_num(id : usize) -> usize{
+    TASK_MANAGER.get_current_syscall_num(id)
+}
+
+/// 检查目标虚拟地址在不在当前运行的任务的地址空间中，并且要满足权限要求
+/// 
+/// 如果在，返回物理地址
+pub fn va_in_current_and_satisfied(va : VirtAddr, flag : PTEFlags) -> Option<PhysAddr> {
+    TASK_MANAGER.va_in_current_and_satisfied(va, flag)
+}
+
+/// 映射一块地址
+pub fn mmap(start_va : VirtAddr, end_va : VirtAddr, permission : MapPermission) -> Result<(),MemoryError> {
+    TASK_MANAGER.mmap(start_va, end_va, permission)
+}
+
+/// 取消映射一块地址
+pub fn munmap(start_va : VirtAddr, end_va : VirtAddr) -> Result<(),MemoryError> {
+    TASK_MANAGER.munmap(start_va, end_va)
 }
