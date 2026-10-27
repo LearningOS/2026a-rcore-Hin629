@@ -54,17 +54,29 @@ impl MemorySet {
     pub fn token(&self) -> usize {
         self.page_table.token()
     }
-    /// Assume that no conflicts.
+    /// 如果插入成功，返回 True
+    /// 
+    /// 如果有插入的区间有已经映射了的，返回 False
+    /// 
+    /// 假定不会出现内存不够的情况
     pub fn insert_framed_area(
         &mut self,
         start_va: VirtAddr,
         end_va: VirtAddr,
         permission: MapPermission,
-    ) {
+    ) -> bool {
+        let new_area = MapArea::new(start_va, end_va, MapType::Framed, permission);
+        for vpn in new_area.vpn_range {
+            // A leaf PTE can exist without a valid mapping (V == 0).
+            if self.translate(vpn).map_or(false, |pte| pte.is_valid()) {
+                return false;
+            }
+        }
         self.push(
             MapArea::new(start_va, end_va, MapType::Framed, permission),
             None,
         );
+        true
     }
     /// remove a area
     pub fn remove_area_with_start_vpn(&mut self, start_vpn: VirtPageNum) {
@@ -297,7 +309,7 @@ impl MemorySet {
             .iter_mut()
             .find(|area| area.vpn_range.get_start() == start.floor())
         {
-            area.shrink_to(&mut self.page_table, new_end.ceil());
+            area.shrink_to(&mut self.page_table,start.floor(), new_end.ceil());
             true
         } else {
             false
@@ -317,6 +329,49 @@ impl MemorySet {
         } else {
             false
         }
+    }
+
+    /// 取消从 st_va 到 ed_va 区间的所有映射
+    pub fn unmap(&mut self, st_va : VirtAddr, ed_va : VirtAddr) -> bool{
+        let st = st_va.floor();
+        let ed = ed_va.ceil();
+        if ed < st {
+            return false;
+        }
+        assert!(ed >= st,"unmap : ed < st");
+        for vpn in VPNRange::new(st, ed) {
+            match self.page_table.translate(vpn) {
+                Some(pte) if pte.is_valid() => {}
+                _ => return false
+            }
+        }
+        let mut tmp = Vec::new();
+        let mut del = Vec::new();
+        for (i,area) in &mut self.areas.iter_mut().enumerate() {
+            let st_a = area.vpn_range.get_start();
+            let ed_a = area.vpn_range.get_end();
+            if st_a >= ed || ed_a <= st {continue;}
+            if st_a >= st && ed_a <= ed {
+                area.unmap(&mut self.page_table); // TODO: 没有把取消映射的这个 maparea 从 vec 里删了，只把内部的信息修改成空区间了
+                del.push(i);
+            }else if st <= st_a {
+                area.shrink_to(&mut self.page_table, ed, ed_a);
+            }else if ed >= ed_a {
+                area.shrink_to(&mut self.page_table, st_a, st);
+            }else {
+                let mut new_area = MapArea::new(ed.into(), ed_a.into(), area.map_type, area.map_perm);
+                for vpn in VPNRange::new(ed,ed_a) {
+                    new_area.data_frames.insert(vpn, area.data_frames.remove(&vpn).unwrap());
+                }
+                area.vpn_range = VPNRange::new(st_a, ed);
+                area.shrink_to(&mut self.page_table, st_a, st);
+                tmp.push(new_area);
+            }
+        }
+        for re in tmp {
+            self.areas.push(re);
+        }
+        true    
     }
 }
 /// map area structure, controls a contiguous piece of virtual memory
@@ -381,13 +436,17 @@ impl MapArea {
         for vpn in self.vpn_range {
             self.unmap_one(page_table, vpn);
         }
+        self.vpn_range = VPNRange::new(self.vpn_range.get_start(), self.vpn_range.get_start());
     }
     #[allow(unused)]
-    pub fn shrink_to(&mut self, page_table: &mut PageTable, new_end: VirtPageNum) {
-        for vpn in VPNRange::new(new_end, self.vpn_range.get_end()) {
-            self.unmap_one(page_table, vpn)
+    pub fn shrink_to(&mut self, page_table: &mut PageTable,new_start : VirtPageNum, new_end: VirtPageNum){
+        for vpn in VPNRange::new(self.vpn_range.get_start(), new_start) {
+            self.unmap_one(page_table, vpn);
         }
-        self.vpn_range = VPNRange::new(self.vpn_range.get_start(), new_end);
+        for vpn in VPNRange::new(new_end, self.vpn_range.get_end()) {
+            self.unmap_one(page_table, vpn);
+        }
+        self.vpn_range = VPNRange::new(new_start, new_end);
     }
     #[allow(unused)]
     pub fn append_to(&mut self, page_table: &mut PageTable, new_end: VirtPageNum) {
