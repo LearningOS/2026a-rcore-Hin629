@@ -5,7 +5,7 @@
 //! `UPSafeCell<OSInodeInner>` -> `OSInode`: for static `ROOT_INODE`,we
 //! need to wrap `OSInodeInner` into `UPSafeCell`
 use super::File;
-use crate::drivers::BLOCK_DEVICE;
+use crate::{drivers::BLOCK_DEVICE, fs::Stat, fs::StatMode};
 use crate::mm::UserBuffer;
 use crate::sync::UPSafeCell;
 use alloc::sync::Arc;
@@ -69,6 +69,16 @@ pub fn list_apps() {
         println!("{}", app);
     }
     println!("**************/");
+}
+
+/// 在根目录下创建文件的硬链接
+pub fn linkat(old_name : &str, new_name : &str) -> Option<()> {
+    ROOT_INODE.linkat(old_name, new_name)
+}
+
+/// 在根目录下取消一个文件路径到文件的链接
+pub fn unlinkat(name : &str) -> Option<()> {
+    ROOT_INODE.unlinkat(name)
 }
 
 bitflags! {
@@ -155,5 +165,16 @@ impl File for OSInode {
             total_write_size += write_size;
         }
         total_write_size
+    }
+    fn stat(&self) -> super::Stat {
+        let inner = self.inner.exclusive_access();
+        let (ino, mode, nlink) = inner.inode.get_status();
+        Stat {
+            dev : 0,
+            ino : ino,
+            mode : StatMode::from_bits_truncate(mode),
+            nlink : nlink,
+            pad : [0;7]
+        }
     }
 }
