@@ -9,11 +9,13 @@ use crate::fs::{File, Stdin, Stdout};
 use crate::mm::{translated_refmut, MemorySet, KERNEL_SPACE};
 use crate::sync::{Condvar, Mutex, Semaphore, UPSafeCell};
 use crate::trap::{trap_handler, TrapContext};
+use alloc::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefMut;
+use core::cmp::Reverse;
 
 /// Process Control Block
 pub struct ProcessControlBlock {
@@ -49,6 +51,16 @@ pub struct ProcessControlBlockInner {
     pub semaphore_list: Vec<Option<Arc<Semaphore>>>,
     /// condvar list
     pub condvar_list: Vec<Option<Arc<Condvar>>>,
+    /// 并发资源可用量
+    pub lock_available : Vec<usize>,
+    /// 是否启用死锁检测功能
+    pub open_dead_lock_check : bool,
+    /// 线程分配矩阵
+    pub lock_allocation : Vec<BTreeMap<usize,usize>>,
+    /// 线程需求矩阵
+    pub lock_need : Vec<BTreeMap<usize,usize>>,
+    // DEADLOCK FIX: 退出线程不能参与安全序列，tid 复用时重新初始化。
+    pub lock_thread_alive: Vec<bool>,
 }
 
 impl ProcessControlBlockInner {
@@ -81,6 +93,140 @@ impl ProcessControlBlockInner {
     /// get a task with tid in this process
     pub fn get_task(&self, tid: usize) -> Arc<TaskControlBlock> {
         self.tasks[tid].as_ref().unwrap().clone()
+    }
+
+    // DEADLOCK FIX: 新线程和复用的 tid 都从空记账开始。
+    pub fn init_lock_thread(&mut self, tid: usize) {
+        self.lock_need
+            .resize_with(self.lock_need.len().max(tid + 1), BTreeMap::new);
+        self.lock_allocation
+            .resize_with(self.lock_allocation.len().max(tid + 1), BTreeMap::new);
+        self.lock_thread_alive
+            .resize(self.lock_thread_alive.len().max(tid + 1), false);
+        self.lock_need[tid].clear();
+        self.lock_allocation[tid].clear();
+        self.lock_thread_alive[tid] = true;
+    }
+
+    // DEADLOCK FIX: 不增加 available；实际同步原语并未因线程退出而释放。
+    pub fn exit_lock_thread(&mut self, tid: usize) {
+        self.lock_thread_alive[tid] = false;
+        self.lock_need[tid].clear();
+        self.lock_allocation[tid].clear();
+    }
+
+    // DEADLOCK FIX: semaphore up 允许无持有记录的线程产生一个许可。
+    // 不猜测它对应其他线程的哪次 down；有自己的持有记录时才扣除。
+    pub fn semaphore_release(&mut self, tid: usize, lock_id: usize) {
+        let allocation = &mut self.lock_allocation[tid];
+        if let Some(count) = allocation.get_mut(&lock_id) {
+            assert!(*count > 0);
+            *count -= 1;
+            if *count == 0 {
+                allocation.remove(&lock_id);
+            }
+        }
+        self.lock_available[lock_id] += 1;
+    }
+
+    /// 为新创建的一个 lock 分配 id，并添加 available 资源
+    pub fn get_new_lock_id(&mut self, cnt : usize) -> usize{
+        let new_id = self.lock_available.len();
+        self.lock_available.push(cnt);
+        new_id
+    }
+
+    /// 尝试 lock，把对应的 need + cnt
+    pub fn try_lock(&mut self,thread_id : usize, lock_id : usize, cnt : usize){
+        let ne =  self.lock_need[thread_id].entry(lock_id).or_insert(0);
+        *ne += cnt;
+    }
+
+    /// 取消 try_lock，把对应的 need - cnt
+    ///
+    /// 检查加锁合法性失败的操作
+    pub fn un_try_lock(&mut self,thread_id : usize, lock_id : usize, cnt : usize){
+        let ne =  self.lock_need[thread_id].entry(lock_id).or_insert(0);
+        *ne -= cnt;
+        if *ne == 0 {
+            self.lock_need[thread_id].remove(&lock_id);
+        }
+    }
+
+    /// 尝试 lock，把对应的 need - cnt，并把 alloc + cnt
+    pub fn lock(&mut self,thread_id : usize, lock_id : usize, cnt : usize) {
+        let ne =  self.lock_need[thread_id].entry(lock_id).or_insert(0);
+        *ne -= cnt;
+        if *ne == 0 {
+            self.lock_need[thread_id].remove(&lock_id);
+        }
+        self.lock_available[lock_id] -= cnt;
+        let al =  self.lock_allocation[thread_id].entry(lock_id).or_insert(0);
+        *al += cnt;
+    }
+
+    /// 取消 lock，把对应的 alloc - cnt
+    pub fn unlock(&mut self,thread_id : usize, lock_id : usize, cnt : usize) {
+        let al =  self.lock_allocation[thread_id].entry(lock_id).or_insert(0);
+        *al -= cnt;
+        self.lock_available[lock_id] += cnt;
+        if *al == 0 {
+            self.lock_allocation[thread_id].remove(&lock_id);
+        }
+    }
+
+    /// 死锁检查
+    pub fn check_dead_lock(&self) -> bool {
+        if !self.open_dead_lock_check {
+            return false;
+        }
+        let mut work = self.lock_available.clone();
+        let resources_num = self.lock_available.len();
+        let thread_num = self.lock_need.len();
+        // DEADLOCK FIX: 仅存活线程需要完成，退出者的资源不能模拟释放。
+        let alive_num = self.lock_thread_alive.iter().filter(|&&alive| alive).count();
+        let mut resoures_need_small_heap: Vec<BinaryHeap<Reverse<(usize, usize)>>> = vec![BinaryHeap::new();resources_num];
+        let mut true_nums = 0;
+        let mut unsatisfaced = vec![0;thread_num];
+        let mut new_upadte: BTreeSet<usize> = BTreeSet::new();
+        for i in 0..thread_num {
+            if !self.lock_thread_alive[i] {
+                continue;
+            }
+            unsatisfaced[i] = self.lock_need[i].len();
+            for (&j,&cnt) in self.lock_need[i].iter() {
+                if cnt <= work[j] {
+                    unsatisfaced[i] -= 1;
+                }else {
+                    resoures_need_small_heap[j].push(Reverse((cnt,i)));
+                }
+            }
+            if unsatisfaced[i] == 0 {
+                true_nums += 1;
+                for (&j, &cnt) in self.lock_allocation[i].iter() {
+                    work[j] += cnt;
+                    new_upadte.insert(j);
+                }
+            }
+        }
+        while let Some(j) = new_upadte.pop_first() {
+            while let Some(&Reverse((cnt,i))) = resoures_need_small_heap[j].peek() {
+                if cnt <= work[j] {
+                    unsatisfaced[i] -= 1;
+                    if unsatisfaced[i] == 0 {
+                        true_nums += 1;
+                        for (&j1, &cnt1) in self.lock_allocation[i].iter() {
+                            work[j1] += cnt1;
+                            new_upadte.insert(j1);
+                        }
+                    }
+                    resoures_need_small_heap[j].pop();
+                }else {
+                    break;
+                }
+            }
+        }
+        true_nums != alive_num
     }
 }
 
@@ -119,6 +265,12 @@ impl ProcessControlBlock {
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
+                    lock_available : Vec::new(),
+                    open_dead_lock_check : false,
+                    lock_allocation : Vec::new(),
+                    lock_need : Vec::new(),
+                    // DEADLOCK FIX: 初始化线程存活记录。
+                    lock_thread_alive: Vec::new(),
                 })
             },
         });
@@ -144,6 +296,8 @@ impl ProcessControlBlock {
         // add main thread to the process
         let mut process_inner = process.inner_exclusive_access();
         process_inner.tasks.push(Some(Arc::clone(&task)));
+        // DEADLOCK FIX: 主线程也通过统一入口初始化。
+        process_inner.init_lock_thread(0);
         drop(process_inner);
         insert_into_pid2process(process.getpid(), Arc::clone(&process));
         // add main thread to scheduler
@@ -245,6 +399,12 @@ impl ProcessControlBlock {
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
+                    lock_available : Vec::new(),
+                    open_dead_lock_check : false,
+                    lock_allocation : Vec::new(),
+                    lock_need : Vec::new(),
+                    // DEADLOCK FIX: 初始化线程存活记录。
+                    lock_thread_alive: Vec::new(),
                 })
             },
         });
@@ -267,6 +427,8 @@ impl ProcessControlBlock {
         // attach task to child process
         let mut child_inner = child.inner_exclusive_access();
         child_inner.tasks.push(Some(Arc::clone(&task)));
+        // DEADLOCK FIX: fork 子进程主线程的检测状态。
+        child_inner.init_lock_thread(0);
         drop(child_inner);
         // modify kstack_top in trap_cx of this thread
         let task_inner = task.inner_exclusive_access();

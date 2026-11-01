@@ -41,6 +41,8 @@ pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
         tasks.push(None);
     }
     tasks[new_task_tid] = Some(Arc::clone(&new_task));
+    // DEADLOCK FIX: tid 复用也要清除旧记录，不能只扩容。
+    process_inner.init_lock_thread(new_task_tid);
     let new_task_trap_cx = new_task_inner.get_trap_cx();
     *new_task_trap_cx = TrapContext::app_init_context(
         entry,

@@ -87,6 +87,8 @@ pub fn exit_current_and_run_next(exit_code: i32) {
     // here we do not remove the thread since we are still using the kstack
     // it will be deallocated when sys_waittid is called
     drop(task_inner);
+    // DEADLOCK FIX: 先结束 task 借用，再标记退出；不释放实际仍占用的资源。
+    process.inner_exclusive_access().exit_lock_thread(tid);
 
     // Move the task to stop-wait status, to avoid kernel stack from being freed
     if tid == 0 {
